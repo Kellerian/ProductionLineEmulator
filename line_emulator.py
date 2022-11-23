@@ -1,11 +1,13 @@
 import sys
 import socket
+import argparse
 from threading import Thread
 from time import sleep
 from collections import deque
-from random import randint
+from random import randint, choices
 from pathlib import Path
 import logging
+from typing import Optional
 
 
 class PrinterEmul:
@@ -80,6 +82,10 @@ class PrinterEmul:
                         row = row.replace('BR,24,24,2,5,250,0,1,', '')
                         row = row.replace('~d034', '"')
                         dm_extracted = row.strip()
+                    elif '^FH^FD_7e' in row:
+                        row = row.replace('^FH^FD_7e', '')
+                        row = row.replace('^FS', '')
+                        dm_extracted = row.strip()
                     if dm_extracted.startswith("~1"):
                         dm_extracted=dm_extracted[2:]
                     r += 1
@@ -91,10 +97,11 @@ class PrinterEmul:
 
 
 class TcpExchanger:
-    def __init__(self, name, codes_to_send,
-                 transfer_buffer=None, listen_port=23,
-                 timeout=0.15, can_stop=False,
-                 gen_errors=False, gen_duplicates=False,
+    def __init__(self, name: str, codes_to_send: deque,
+                 transfer_buffer: Optional[dict[str, list[str]]]=None, listen_port: int=23,
+                 timeout: float=0.15, can_stop: bool=False,
+                 gen_errors: bool=False, gen_duplicates: bool=False,
+                 error_percent: int = 2,
                  stack=1):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setblocking(False)
@@ -108,6 +115,7 @@ class TcpExchanger:
         self.timeout = timeout
         self.name = name
         self.gen_errors = gen_errors
+        self.error_percent = error_percent
         self.gen_duplicates = gen_duplicates
         self.thread = Thread(target=self.run)
         self.stack = stack
@@ -128,13 +136,12 @@ class TcpExchanger:
             if len(self.connections):
                 sleep(self.timeout)
                 if self.codes:
-                    message = self.codes.popleft()
-                    if self.gen_errors:
-                        if randint(1, 100) <= 2:
-                            message = 'error'
-                    if self.gen_duplicates:
-                        if randint(1, 100) <= 1:
-                            message = "\n\r".join([message, message])
+                    if self.gen_errors and randint(0, 100) <= self.error_percent:
+                        message = 'error'
+                    else:
+                        message = self.codes.popleft()
+                    if self.gen_duplicates and randint(0, 100) <= self.error_percent:
+                        message = "\n\r".join([message, message])
                     self.stack_pool.append(message)
                     if len(self.stack_pool) == self.stack:
                         message = "\n\r".join(self.stack_pool)
@@ -162,14 +169,16 @@ class TcpExchanger:
 
 
 class SerialisationSetup:
-    def __init__(self, printer_port: int, camera_port):
+    def __init__(self, printer_port: int, camera_port: int, gen_errors: bool=False, error_percent: int=2):
         self.agr_buffer = list()
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNSER', self.dm_list, printer_port)
         self.dm_camera = TcpExchanger(
             "DMSER", self.dm_list,
             transfer_buffer=self.agr_buffer,
-            listen_port=camera_port
+            listen_port=camera_port,
+            gen_errors=gen_errors,
+            error_percent=error_percent
         )
 
     def run(self):
@@ -250,9 +259,12 @@ class RefubrishingSetup:
         self.dm_camera.start()
 
 
-def main_ser(multicam_count: int = 3):
-    sr = SerialisationSetup(9101, 23)
-    agr_setup = AggregationSetup(27, sr.agr_buffer, multicam_count)
+def main_ser(args):
+    agr_count = args.agr_count
+    gen_err = args.gen_err
+    perc_err = args.perc_err
+    sr = SerialisationSetup(9101, 23, gen_err, perc_err)
+    agr_setup = AggregationSetup(27, sr.agr_buffer, agr_count)
     agr_ver = AggregationVerificationSetup(9102, 32)
     p = PalletPrinter(9103)
 
@@ -262,7 +274,7 @@ def main_ser(multicam_count: int = 3):
     p.run()
 
 
-def main_refub():
+def main_refub(args):
     if getattr(sys, 'frozen', False):
         curPath = Path(sys.executable).parents[0]
     else:
@@ -287,29 +299,25 @@ if __name__ == '__main__':
     stream_handler.setFormatter(formatter)
     root.addHandler(stream_handler)
 
-    if len(sys.argv) == 1:
-        logging.info(
-            "? - информация по использованию\n"
-        )
-    elif sys.argv[1] == '?':
-        logging.info(
-            "Параметры запуска:\n"
-            "\tr - режим отбраковки. КМ для передачи на отраковку считываются из файла dm.csv рядом с исполняемым файлом\n"
-            "\ts - режим сериализации. После s через пробел можно указать кол-во камер агрегации (1-9), наример s 3 - запуск сериализации с тремя камерами агрегации (три ручья)\n"
-        )
-    elif sys.argv[1] == 'r':
-        main_refub()
-    elif sys.argv[1] == 's':
-        if len(sys.argv) == 3:
-            if sys.argv[2].isdigit():
-                num_cams = int(sys.argv[2])
-                if num_cams in range(1,10):
-                    main_ser(multicam_count=num_cams)
-                else:
-                    logging.error("Укажите количество камер агрегации от 1 до 9")
-            else:
-                logging.error("Укажите количество камер агрегации от 1 до 9")
-    else:
-        logging.info(
-            "? - информация по использованию\n"
-        )
+    parser = argparse.ArgumentParser(
+        prog='Эмулятор промышленной линии',
+        description='Эмулирует работу промышленной линии на производстве маркированной продукции',
+        epilog='help - информация по использованию'
+    )
+    subparsers = parser.add_subparsers(help="Параметры запуска")
+    parser_s = subparsers.add_parser('s', help='Запуск в режиме сериализации')
+    parser_s.add_argument(
+        '-a', '--agr_count', choices=range(1,10), required=False, type=int, default=3, help='Количество камер агрегации от 1 до 9'
+    )
+    parser_s.add_argument(
+        '-g', '--gen_err', choices=(0, 1), required=False, type=int, default=0, help='Генерировать ошибки сериализации: 0 - нет, 1 - да'
+    )
+    parser_s.add_argument(
+        '-e', '--perc_err', choices=range(1, 100), required=False, type=int, default=2, help='Процентр брака сериализации'
+    )
+    parser_s.set_defaults(func=main_ser)
+    parser_r = subparsers.add_parser('r', help='Запуск в режиме отбраковки')
+    parser_r.set_defaults(func=main_refub)
+
+    args = parser.parse_args()
+    args.func(args)
