@@ -4,7 +4,7 @@ import argparse
 from threading import Thread
 from time import sleep
 from collections import deque
-from random import randint, choices
+from random import randint
 from pathlib import Path
 import logging
 from typing import Optional
@@ -61,8 +61,6 @@ class PrinterEmul:
                     connections.remove(client)
                 if not msg_received:
                     continue
-                # logging.debug(f"[#{i}] <{self.name}> PRINTED:\n{msg_received}")
-                # logging.debug('=' * 15)
                 msg_rows = msg_received.split("\n")
                 r = 0
                 for row in msg_rows:
@@ -87,22 +85,42 @@ class PrinterEmul:
                         row = row.replace('^FS', '')
                         dm_extracted = row.strip()
                     if dm_extracted.startswith("~1"):
-                        dm_extracted=dm_extracted[2:]
+                        dm_extracted = dm_extracted[2:]
                     r += 1
                     if dm_extracted:
-                        logging.info(f"[#{i}] <{self.name}> PRINTED: {dm_extracted}")
+                        logging.info(f"[#{i}] <{self.name}> "
+                                     f"PRINTED: {dm_extracted}")
                         self.dm_list.append(dm_extracted)
                         i += 1
             sleep(0.01)
 
 
+class FilePrinterEmul:
+    def __init__(self, name, dm_list: deque, dm_file_path: Path):
+        self.name = name
+        self.dm_list = dm_list
+        self.thread = Thread(target=self.run)
+        self.dm_file_path = dm_file_path
+
+    def start(self):
+        self.thread.start()
+
+    def run(self):
+        with open(self.dm_file_path, 'r') as f:
+            sleep(5)
+            for line in f:
+                self.dm_list.append(line.strip())
+                sleep(0.02)
+
+
 class TcpExchanger:
     def __init__(self, name: str, codes_to_send: deque,
-                 transfer_buffer: Optional[dict[str, list[str]]]=None, listen_port: int=23,
-                 timeout: float=0.15, can_stop: bool=False,
-                 gen_errors: bool=False, gen_duplicates: bool=False,
+                 transfer_buffer: list[deque] = None,
+                 listen_port: int = 23,
+                 timeout: float = 0.15, can_stop: bool = False,
+                 gen_errors: bool = False, gen_duplicates: bool = False,
                  error_percent: int = 2,
-                 stack=1):
+                 stack=1, drop_dm_percent: int = 0):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setblocking(False)
         self.port = listen_port
@@ -119,6 +137,7 @@ class TcpExchanger:
         self.gen_duplicates = gen_duplicates
         self.thread = Thread(target=self.run)
         self.stack = stack
+        self.drop_dm_percent = drop_dm_percent
         self.stack_pool = []
 
     def start(self):
@@ -135,54 +154,99 @@ class TcpExchanger:
                 pass
             if len(self.connections):
                 sleep(self.timeout)
-                if self.codes:
-                    if self.gen_errors and randint(0, 100) <= self.error_percent:
-                        message = 'error'
-                    else:
-                        message = self.codes.popleft()
-                    if self.gen_duplicates and randint(0, 100) <= self.error_percent:
-                        message = "\n\r".join([message, message])
-                    self.stack_pool.append(message)
-                    if len(self.stack_pool) == self.stack:
-                        message = "\n\r".join(self.stack_pool)
-                        self.stack_pool.clear()
-                    else:
-                        continue
+                if not self.codes:
+                    continue
+                if self.gen_errors and randint(0, 100) <= self.error_percent:
+                    message = 'error'
+                else:
+                    message = self.codes.popleft()
+                if (
+                    self.gen_duplicates and
+                    randint(0, 100) <= self.error_percent
+                ):
+                    message = "\n\r".join([message, message])
+                self.stack_pool.append(message)
+                if len(self.stack_pool) == self.stack:
+                    message = "\n\r".join(self.stack_pool)
+                    self.stack_pool.clear()
+                else:
+                    continue
+                logging.info(
+                    f"[{len(self.codes)}]<{self.name}> "
+                    f"SENT: {message.strip()}"
+                )
+
+                if self.drop_dm_percent and randint(0, 100) <= self.drop_dm_percent:
                     logging.info(f"[{len(self.codes)}]<{self.name}> "
-                          f"SENT: {message.strip()}")
+                                 f"DROPPED: {message.strip()}")
+                else:
                     for client in self.connections:
                         try:
                             client.send(bytes(message + "\n\r", 'utf-8'))
                         except ConnectionAbortedError:
-                            pass
                             continue
                         except Exception as e:
-                            logging.warning(f"[{len(self.codes)}]<{self.name}> ERROR: {client} {e}")
+                            logging.warning(f"[{len(self.codes)}]<{self.name}>"
+                                            f" ERROR: {client} {e}")
                             self.connections.remove(client)
-                    if self.transfer_buffer is not None:
-                        if 'error' not in message:
-                            self.transfer_buffer[i].append(message)
-                            i += 1
-                            if i >= len(self.transfer_buffer):
-                                i = 0
+
+                if self.transfer_buffer is not None:
+                    if 'error' not in message:
+                        self.transfer_buffer[i].append(message)
+                        i += 1
+                        if i >= len(self.transfer_buffer):
+                            i = 0
             sleep(0.01)
 
 
 class SerialisationSetup:
-    def __init__(self, printer_port: int, camera_port: int, gen_errors: bool=False, error_percent: int=2):
+    def __init__(self, printer_port: int, camera_port: int,
+                 gen_errors: bool = False, error_percent: int = 2,
+                 drop_dm_percent: int = 0):
         self.agr_buffer = list()
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNSER', self.dm_list, printer_port)
+        self.dm_camera = TcpExchanger(
+            name="DMSER",
+            codes_to_send=self.dm_list,
+            transfer_buffer=self.agr_buffer,
+            listen_port=camera_port,
+            gen_errors=gen_errors,
+            error_percent=error_percent,
+            drop_dm_percent=drop_dm_percent
+        )
+
+    def run(self):
+        logging.info(f"Started DM printer at port {self.dm_printer.port}...")
+        self.dm_printer.start()
+        logging.info(f"Started DM camera at port {self.dm_camera.port}...")
+        self.dm_camera.start()
+
+
+class SerialisationFromFileSetup:
+    def __init__(self, camera_port: int, gen_errors: bool = False,
+                 error_percent: int = 2, drop_dm_percent: int = 0):
+        self.agr_buffer = list()
+        self.dm_list = deque([])
+        if getattr(sys, 'frozen', False):
+            curPath = Path(sys.executable).parents[0]
+        else:
+            curPath = Path(__file__).parents[0]
+
+        path_out = curPath / 'dm.csv'
+        self.dm_file_path = path_out
+        self.dm_printer = FilePrinterEmul('PRNSER', self.dm_list, self.dm_file_path)
         self.dm_camera = TcpExchanger(
             "DMSER", self.dm_list,
             transfer_buffer=self.agr_buffer,
             listen_port=camera_port,
             gen_errors=gen_errors,
-            error_percent=error_percent
+            error_percent=error_percent,
+            drop_dm_percent=drop_dm_percent
         )
 
     def run(self):
-        logging.info(f"Started DM printer at port {self.dm_printer.port}...")
+        logging.info(f"DM source file path {self.dm_file_path}...")
         self.dm_printer.start()
         logging.info(f"Started DM camera at port {self.dm_camera.port}...")
         self.dm_camera.start()
@@ -199,14 +263,18 @@ class AggregationVerificationSetup:
         )
 
     def run(self):
-        logging.info(f"Started Aggregation printer at port {self.dm_printer.port}...")
+        logging.info("Started Aggregation printer at "
+                     f"port {self.dm_printer.port}...")
         self.dm_printer.start()
-        logging.info(f"Started Aggregation verification camera at port {self.dm_camera.port}...")
+        logging.info("Started Aggregation verification camera "
+                     f"at port {self.dm_camera.port}...")
         self.dm_camera.start()
 
 
 class AggregationSetup:
-    def __init__(self, start_port: int, agr_buffer: list[deque], count: int = 1):
+    def __init__(self, start_port: int,
+                 agr_buffer: list[deque],
+                 count: int = 1):
         self.agr_cam_list = dict[str, TcpExchanger]()
         self.start_port = start_port
         self.agr_buffer = agr_buffer
@@ -218,14 +286,15 @@ class AggregationSetup:
             self.agr_buffer.append(deque([]))
             cam_name = f"AGR_{i}"
             self.agr_cam_list[cam_name] = TcpExchanger(
-                cam_name, self.agr_buffer[i],
+                name=cam_name, codes_to_send=self.agr_buffer[i],
                 listen_port=self.start_port + i, timeout=self.default_timeout
             )
 
     def run(self):
         self.gen_cameras()
         for camera, camera_obj in self.agr_cam_list.items():
-            logging.info(f"Starting aggregation multicamera {camera} at port {camera_obj.port}...")
+            logging.info(f"Starting aggregation multicamera {camera} at "
+                         f"port {camera_obj.port}...")
             camera_obj.start()
 
 
@@ -235,7 +304,7 @@ class PalletPrinter:
         self.printer = PrinterEmul('PRNPAL', self.data, port)
 
     def run(self):
-        logging.info(f"Starting palette printer at port {self.printer.port}...")
+        logging.info(f"Starting palette printer at port {self.printer.port}..")
         self.printer.start()
 
 
@@ -263,7 +332,12 @@ def main_ser(args):
     agr_count = args.agr_count
     gen_err = args.gen_err
     perc_err = args.perc_err
-    sr = SerialisationSetup(9101, 23, gen_err, perc_err)
+    dm_file = args.dm_file
+    drop_dm = args.drop_dm
+    if dm_file:
+        sr = SerialisationFromFileSetup(23, gen_err, perc_err, drop_dm)
+    else:
+        sr = SerialisationSetup(9101, 23, gen_err, perc_err, drop_dm)
     agr_setup = AggregationSetup(27, sr.agr_buffer, agr_count)
     agr_ver = AggregationVerificationSetup(9102, 32)
     p = PalletPrinter(9103)
@@ -294,30 +368,47 @@ def main_refub(args):
 if __name__ == '__main__':
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(fmt='%(asctime)s [%(name)s][%(levelname)s]: %(message)s', datefmt='%d.%m.%Y %H:%M:%S')
+    formatter = logging.Formatter(fmt='%(asctime)s [%(name)s][%(levelname)s]:'
+                                  ' %(message)s', datefmt='%d.%m.%Y %H:%M:%S')
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     root.addHandler(stream_handler)
 
     parser = argparse.ArgumentParser(
         prog='Эмулятор промышленной линии',
-        description='Эмулирует работу промышленной линии на производстве маркированной продукции',
+        description='Эмулирует работу промышленной линии на '
+        'производстве маркированной продукции',
         epilog='help - информация по использованию'
     )
     subparsers = parser.add_subparsers(help="Параметры запуска")
     parser_s = subparsers.add_parser('s', help='Запуск в режиме сериализации')
     parser_s.add_argument(
-        '-a', '--agr_count', choices=range(1,10), required=False, type=int, default=3, help='Количество камер агрегации от 1 до 9'
+        '-f', '--dm_file', choices=(0, 1), required=False, type=int,
+        default=0, help='Передавать марки из файла dm.csv. Используется для эмуляции линии без печати КМ.'
     )
     parser_s.add_argument(
-        '-g', '--gen_err', choices=(0, 1), required=False, type=int, default=0, help='Генерировать ошибки сериализации: 0 - нет, 1 - да'
+        '-a', '--agr_count', choices=range(1, 10), required=False, type=int,
+        default=3, help='Количество камер агрегации от 1 до 9'
     )
     parser_s.add_argument(
-        '-e', '--perc_err', choices=range(1, 100), required=False, type=int, default=2, help='Процентр брака сериализации'
+        '-g', '--gen_err', choices=(0, 1), required=False, type=int,
+        default=0, help='Генерировать ошибки сериализации: 0 - нет, 1 - да'
+    )
+    parser_s.add_argument(
+        '-e', '--perc_err', choices=range(1, 100), required=False, type=int,
+        default=2, help='Процентр брака сериализации'
+    )
+    parser_s.add_argument(
+        '-d', '--drop_dm', choices=range(0, 6), required=False, type=int,
+        default=0, help='Процентр пропуска кодов на сериализации'
     )
     parser_s.set_defaults(func=main_ser)
     parser_r = subparsers.add_parser('r', help='Запуск в режиме отбраковки')
     parser_r.set_defaults(func=main_refub)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except AttributeError:
+        parser.print_help()
+        parser.exit()
