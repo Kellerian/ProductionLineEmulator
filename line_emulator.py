@@ -54,7 +54,6 @@ class PrinterEmul:
                 try:
                     msg_received = self.receive_all(client)
                 except ConnectionAbortedError:
-                    pass
                     continue
                 except Exception as e:
                     logging.error(f"[#{i}] <{self.name}> ERROR: {client} {e}")
@@ -202,12 +201,14 @@ class TcpExchanger:
 class SerialisationSetup:
     def __init__(self, printer_port: int, camera_port: int,
                  gen_errors: bool = False, error_percent: int = 2,
-                 drop_dm_percent: int = 0):
+                 drop_dm_percent: int = 0,
+                 read_interval: float = 0.15):
         self.agr_buffer = list()
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNSER', self.dm_list, printer_port)
         self.dm_camera = TcpExchanger(
             name="DMSER",
+            timeout=read_interval,
             codes_to_send=self.dm_list,
             transfer_buffer=self.agr_buffer,
             listen_port=camera_port,
@@ -225,7 +226,8 @@ class SerialisationSetup:
 
 class SerialisationFromFileSetup:
     def __init__(self, camera_port: int, gen_errors: bool = False,
-                 error_percent: int = 2, drop_dm_percent: int = 0):
+                 error_percent: int = 2, drop_dm_percent: int = 0,
+                 read_interval: float = 0.15):
         self.agr_buffer = list()
         self.dm_list = deque([])
         if getattr(sys, 'frozen', False):
@@ -239,6 +241,7 @@ class SerialisationFromFileSetup:
         self.dm_camera = TcpExchanger(
             "DMSER", self.dm_list,
             transfer_buffer=self.agr_buffer,
+            timeout=read_interval,
             listen_port=camera_port,
             gen_errors=gen_errors,
             error_percent=error_percent,
@@ -253,12 +256,13 @@ class SerialisationFromFileSetup:
 
 
 class AggregationVerificationSetup:
-    def __init__(self, printer_port: int, camera_port: int):
+    def __init__(self, printer_port: int, camera_port: int, read_interval: float = 0.25):
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNAGR', self.dm_list, printer_port)
         self.dm_camera = TcpExchanger(
             "VERIF", self.dm_list, can_stop=True,
-            listen_port=camera_port, timeout=0.25,
+            listen_port=camera_port,
+            timeout=read_interval,
             gen_errors=False, gen_duplicates=False
         )
 
@@ -272,14 +276,13 @@ class AggregationVerificationSetup:
 
 
 class AggregationSetup:
-    def __init__(self, start_port: int,
-                 agr_buffer: list[deque],
-                 count: int = 1):
+    def __init__(self, start_port: int, agr_buffer: list[deque],
+                 count: int = 1, read_interval: float = 0.25):
         self.agr_cam_list = dict[str, TcpExchanger]()
         self.start_port = start_port
         self.agr_buffer = agr_buffer
         self.count = count
-        self.default_timeout = 0.25
+        self.default_timeout = read_interval
     
     def gen_cameras(self):
         for i in range(self.count):
@@ -334,12 +337,14 @@ def main_ser(args):
     perc_err = args.perc_err
     dm_file = args.dm_file
     drop_dm = args.drop_dm
+    read_interval = args.read_interval
+    print("OPTIONS:", agr_count, gen_err, perc_err, dm_file,drop_dm, read_interval)
     if dm_file:
-        sr = SerialisationFromFileSetup(23, gen_err, perc_err, drop_dm)
+        sr = SerialisationFromFileSetup(23, gen_err, perc_err, drop_dm, read_interval=read_interval)
     else:
-        sr = SerialisationSetup(9101, 23, gen_err, perc_err, drop_dm)
-    agr_setup = AggregationSetup(27, sr.agr_buffer, agr_count)
-    agr_ver = AggregationVerificationSetup(9102, 32)
+        sr = SerialisationSetup(9101, 23, gen_errors=gen_err, error_percent=perc_err, drop_dm_percent=drop_dm, read_interval=read_interval)
+    agr_setup = AggregationSetup(27, sr.agr_buffer, agr_count, read_interval=read_interval)
+    agr_ver = AggregationVerificationSetup(9102, 32, read_interval=read_interval)
     p = PalletPrinter(9103)
 
     sr.run()
@@ -381,6 +386,7 @@ if __name__ == '__main__':
         epilog='help - информация по использованию'
     )
     subparsers = parser.add_subparsers(help="Параметры запуска")
+    # Парсер настроек режима сериализации
     parser_s = subparsers.add_parser('s', help='Запуск в режиме сериализации')
     parser_s.add_argument(
         '-f', '--dm_file', choices=(0, 1), required=False, type=int,
@@ -402,7 +408,13 @@ if __name__ == '__main__':
         '-d', '--drop_dm', choices=range(0, 6), required=False, type=int,
         default=0, help='Процентр пропуска кодов на сериализации'
     )
+    parser_s.add_argument(
+        '-r', '--read_interval', required=False, type=float,
+        default=0.15, help='Интервал передачи кодов маркировки (сек), например 0.15 = 150мс'
+    )
     parser_s.set_defaults(func=main_ser)
+
+    # Парсер для активации режима отбраковки
     parser_r = subparsers.add_parser('r', help='Запуск в режиме отбраковки')
     parser_r.set_defaults(func=main_refub)
 
