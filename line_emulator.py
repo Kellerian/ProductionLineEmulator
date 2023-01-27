@@ -1,13 +1,33 @@
 import sys
 import socket
 import argparse
+from enum import Enum
 from threading import Thread
 from time import sleep
 from collections import deque
-from random import randint
+from random import randint, choice
 from pathlib import Path
 import logging
-from typing import Optional
+
+
+class CodeQuality(Enum):
+    A = 'A'
+    B = 'B'
+    C = 'C'
+    D = 'D'
+    E = 'E'
+    F = 'F'
+
+GOOD_CODES = (
+    CodeQuality.A.value,
+    CodeQuality.B.value
+)
+BAD_CODES = (
+    CodeQuality.C.value,
+    CodeQuality.D.value,
+    CodeQuality.E.value,
+    CodeQuality.F.value
+)
 
 
 class PrinterEmul:
@@ -115,11 +135,12 @@ class FilePrinterEmul:
 class TcpExchanger:
     def __init__(self, name: str, codes_to_send: deque,
                  transfer_buffer: list[deque] = None,
-                 listen_port: int = 23,
-                 timeout: float = 0.15, can_stop: bool = False,
-                 gen_errors: bool = False, gen_duplicates: bool = False,
-                 error_percent: int = 2,
-                 stack=1, drop_dm_percent: int = 0):
+                 listen_port: int = 23, timeout: float = 0.15,
+                 can_stop: bool = False, gen_errors: bool = False,
+                 gen_duplicates: bool = False, error_percent: int = 2,
+                 stack=1, drop_dm_percent: int = 0,
+                 add_code_quality: bool = False,
+                 bad_codes_percent: int = 0):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setblocking(False)
         self.port = listen_port
@@ -132,6 +153,8 @@ class TcpExchanger:
         self.timeout = timeout
         self.name = name
         self.gen_errors = gen_errors
+        self.add_code_quality = add_code_quality
+        self.bad_codes_percent = bad_codes_percent
         self.error_percent = error_percent
         self.gen_duplicates = gen_duplicates
         self.thread = Thread(target=self.run)
@@ -159,6 +182,11 @@ class TcpExchanger:
                     message = 'error'
                 else:
                     message = self.codes.popleft()
+                    if self.add_code_quality:
+                        if randint(0, 100) <= self.bad_codes_percent:
+                            message += f'@{choice(BAD_CODES)}'
+                        else:
+                            message += f'@{choice(GOOD_CODES)}'
                 if (
                     self.gen_duplicates and
                     randint(0, 100) <= self.error_percent
@@ -174,10 +202,12 @@ class TcpExchanger:
                     f"[{len(self.codes)}]<{self.name}> "
                     f"SENT: {message.strip()}"
                 )
-
+                
                 if self.drop_dm_percent and randint(0, 100) <= self.drop_dm_percent:
-                    logging.info(f"[{len(self.codes)}]<{self.name}> "
-                                 f"DROPPED: {message.strip()}")
+                    logging.info(
+                        f"[{len(self.codes)}]<{self.name}> "
+                        f"DROPPED: {message.strip()}"
+                    )
                 else:
                     for client in self.connections:
                         try:
@@ -185,13 +215,15 @@ class TcpExchanger:
                         except ConnectionAbortedError:
                             continue
                         except Exception as e:
-                            logging.warning(f"[{len(self.codes)}]<{self.name}>"
-                                            f" ERROR: {client} {e}")
+                            logging.warning(
+                                f"[{len(self.codes)}]<{self.name}>"
+                                f" ERROR: {client} {e}"
+                            )
                             self.connections.remove(client)
 
                 if self.transfer_buffer is not None:
                     if 'error' not in message:
-                        self.transfer_buffer[i].append(message)
+                        self.transfer_buffer[i].append(message[:-2] if self.add_code_quality else message)
                         i += 1
                         if i >= len(self.transfer_buffer):
                             i = 0
@@ -202,7 +234,9 @@ class SerialisationSetup:
     def __init__(self, printer_port: int, camera_port: int,
                  gen_errors: bool = False, error_percent: int = 2,
                  drop_dm_percent: int = 0,
-                 read_interval: float = 0.15):
+                 read_interval: float = 0.15,
+                 add_code_quality: bool = False,
+                 bad_codes_percent: int = 0):
         self.agr_buffer = list()
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNSER', self.dm_list, printer_port)
@@ -214,7 +248,9 @@ class SerialisationSetup:
             listen_port=camera_port,
             gen_errors=gen_errors,
             error_percent=error_percent,
-            drop_dm_percent=drop_dm_percent
+            drop_dm_percent=drop_dm_percent,
+            add_code_quality=add_code_quality,
+            bad_codes_percent=bad_codes_percent
         )
 
     def run(self):
@@ -227,7 +263,9 @@ class SerialisationSetup:
 class SerialisationFromFileSetup:
     def __init__(self, camera_port: int, gen_errors: bool = False,
                  error_percent: int = 2, drop_dm_percent: int = 0,
-                 read_interval: float = 0.15):
+                 read_interval: float = 0.15,
+                 add_code_quality: bool = False,
+                 bad_codes_percent: int = 0):
         self.agr_buffer = list()
         self.dm_list = deque([])
         if getattr(sys, 'frozen', False):
@@ -245,7 +283,9 @@ class SerialisationFromFileSetup:
             listen_port=camera_port,
             gen_errors=gen_errors,
             error_percent=error_percent,
-            drop_dm_percent=drop_dm_percent
+            drop_dm_percent=drop_dm_percent,
+            add_code_quality=add_code_quality,
+            bad_codes_percent=bad_codes_percent
         )
 
     def run(self):
@@ -338,11 +378,29 @@ def main_ser(args):
     dm_file = args.dm_file
     drop_dm = args.drop_dm
     read_interval = args.read_interval
-    print("OPTIONS:", agr_count, gen_err, perc_err, dm_file,drop_dm, read_interval)
+    add_code_quality = args.add_code_quality
+    bad_code_quality_percent = args.bad_code_quality_percent
+
     if dm_file:
-        sr = SerialisationFromFileSetup(23, gen_err, perc_err, drop_dm, read_interval=read_interval)
+        sr = SerialisationFromFileSetup(
+            23,
+            gen_err,
+            perc_err,
+            drop_dm,
+            read_interval=read_interval,
+            add_code_quality=add_code_quality,
+            bad_codes_percent=bad_code_quality_percent
+        )
     else:
-        sr = SerialisationSetup(9101, 23, gen_errors=gen_err, error_percent=perc_err, drop_dm_percent=drop_dm, read_interval=read_interval)
+        sr = SerialisationSetup(
+            9101, 23,
+            gen_errors=gen_err,
+            error_percent=perc_err,
+            drop_dm_percent=drop_dm,
+            read_interval=read_interval,
+            add_code_quality=add_code_quality,
+            bad_codes_percent=bad_code_quality_percent
+        )
     agr_setup = AggregationSetup(27, sr.agr_buffer, agr_count, read_interval=read_interval)
     agr_ver = AggregationVerificationSetup(9102, 32, read_interval=read_interval)
     p = PalletPrinter(9103)
@@ -411,6 +469,14 @@ if __name__ == '__main__':
     parser_s.add_argument(
         '-r', '--read_interval', required=False, type=float,
         default=0.15, help='Интервал передачи кодов маркировки (сек), например 0.15 = 150мс'
+    )
+    parser_s.add_argument(
+        '-q', '--add_code_quality', required=False, type=float,
+        default=0.15, help='Добавлять флаг качества кода в конец КМ: 0 - нет, 1 - да'
+    )
+    parser_s.add_argument(
+        '-qe', '--bad_code_quality_percent', choices=range(1, 100), required=False, type=float,
+        default=0.15, help='Процент кодов плохого качества (ниже B)'
     )
     parser_s.set_defaults(func=main_ser)
 
