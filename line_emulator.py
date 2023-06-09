@@ -18,10 +18,13 @@ class CodeQuality(Enum):
     E = 'E'
     F = 'F'
 
+
 GOOD_CODES = (
     CodeQuality.A.value,
     CodeQuality.B.value
 )
+
+
 BAD_CODES = (
     CodeQuality.C.value,
     CodeQuality.D.value,
@@ -31,7 +34,9 @@ BAD_CODES = (
 
 
 class PrinterEmul:
-    def __init__(self, name, dm_list: deque, port: int):
+    def __init__(
+        self, name, dm_list: deque, port: int
+    ):
         self.SIZE = 4096
         self.name = name
         self.FORMAT = "utf-8"
@@ -72,7 +77,7 @@ class PrinterEmul:
             for client in connections:
                 msg_received = ''
                 try:
-                    msg_received = self.receive_all(client)
+                    msg_received = self.receive_all(client).strip()
                 except ConnectionAbortedError:
                     continue
                 except Exception as e:
@@ -80,37 +85,61 @@ class PrinterEmul:
                     connections.remove(client)
                 if not msg_received:
                     continue
-                msg_rows = msg_received.split("\n")
-                r = 0
-                for row in msg_rows:
-                    dm_extracted = ''
-                    if 'BARCODE=' in row:
-                        row = row.replace('BARCODE=', '')
-                        row = row.replace('~d034', '"')
-                        dm_extracted = row.strip()
-                    elif 'DMATRIX 10,10,400,400,c126,' in row:
-                        row = row.replace('DMATRIX 10,10,400,400,c126,', '')
-                        row = row.replace('~d034', '"')
-                        dm_extracted = row[1:-1].strip()
-                    elif 'XRB0,0,6,0,' in row:
-                        row = msg_rows[r + 1]
-                        dm_extracted = row.strip()
-                    elif 'BR,24,24,2,5,250,0,1,' in row:
-                        row = row.replace('BR,24,24,2,5,250,0,1,', '')
-                        row = row.replace('~d034', '"')
-                        dm_extracted = row.strip()
-                    elif '^FH^FD_7e' in row:
-                        row = row.replace('^FH^FD_7e', '')
-                        row = row.replace('^FS', '')
-                        dm_extracted = row.strip()
-                    if dm_extracted.startswith("~1"):
-                        dm_extracted = dm_extracted[2:]
-                    r += 1
-                    if dm_extracted:
-                        logging.info(f"[#{i}] <{self.name}> "
-                                     f"PRINTED: {dm_extracted}")
-                        self.dm_list.append(dm_extracted)
-                        i += 1
+                # logging.debug(f"DATA INPUT: {msg_received}")
+                if msg_received == f"{chr(27)}!?":
+                    client.send('\x00'.encode())
+                elif msg_received == "~S,CHECK":
+                    client.send('00'.encode())
+                elif msg_received == "OUT @LABEL":
+                    logging.debug(f"PRINTED: {i}")
+                    client.send(f"{i}".encode())
+                elif msg_received == "~S,LABEL":
+                    logging.debug(f"FREE BUFFER: {1}")
+                    client.send(f"{1}".encode())
+                else:
+                    msg_rows = msg_received.split("\n")
+                    r = 0
+                    for row in msg_rows:
+                        dm_extracted = ''
+                        if 'BARCODE=' in row:
+                            row = row.replace('BARCODE=', '')
+                            row = row.replace('~d034', '"')
+                            dm_extracted = row.strip()
+                        elif 'DMATRIX' in row:
+                            row = row.replace(
+                                'DMATRIX 10,10,400,400,c126,', ''
+                            )
+                            row = row.replace('~d034', '"')
+                            dm_extracted = row[1:-1].strip()
+                        elif 'XRB0,0,' in row:
+                            row = msg_rows[r + 1]
+                            dm_extracted = row.strip()
+                        elif 'BR,24,24' in row:
+                            row = row.replace('BR,24,24,2,5,250,0,1,', '')
+                            row = row.replace('~d034', '"')
+                            dm_extracted = row.strip()
+                        elif '^FH^FD_7e' in row:
+                            row = row.replace('^FH^FD_7e', '')
+                            row = row.replace('^FS', '')
+                            dm_extracted = row.strip()
+                        if dm_extracted.startswith("~1"):
+                            dm_extracted = dm_extracted[2:]
+                        r += 1
+                        if dm_extracted:
+                            if '05060367340398' in dm_extracted:
+                                volume = randint(100, 1000)
+                                dm_extracted = (
+                                    f"{dm_extracted}{chr(29)}3353{volume:06}"
+                                )
+                            elif '07808631857726' in dm_extracted:
+                                weight = randint(100, 1000)
+                                dm_extracted = (
+                                    f"{dm_extracted}{chr(29)}3103{weight:06}"
+                                )
+                            logging.info(f"[#{i}] <{self.name}> "
+                                         f"PRINTED: {dm_extracted}")
+                            self.dm_list.append(dm_extracted)
+                            i += 1
             sleep(0.01)
 
 
@@ -133,14 +162,20 @@ class FilePrinterEmul:
 
 
 class TcpExchanger:
-    def __init__(self, name: str, codes_to_send: deque,
-                 transfer_buffer: list[deque] = None,
-                 listen_port: int = 23, timeout: float = 0.15,
-                 can_stop: bool = False, gen_errors: bool = False,
-                 gen_duplicates: bool = False, error_percent: int = 2,
-                 stack=1, drop_dm_percent: int = 0,
-                 add_code_quality: bool = False,
-                 bad_codes_percent: int = 0):
+    def __init__(
+        self, name: str,
+        codes_to_send: deque,
+        transfer_buffer: list[deque] = None,
+        listen_port: int = 23,
+        timeout: float = 0.15,
+        can_stop: bool = False,
+        gen_errors: bool = False,
+        error_percent: int = 2,
+        stack=1,
+        drop_dm_percent: int = 0,
+        add_code_quality: bool = False,
+        bad_codes_percent: int = 0
+    ):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setblocking(False)
         self.port = listen_port
@@ -156,13 +191,14 @@ class TcpExchanger:
         self.add_code_quality = add_code_quality
         self.bad_codes_percent = bad_codes_percent
         self.error_percent = error_percent
-        self.gen_duplicates = gen_duplicates
         self.thread = Thread(target=self.run)
         self.stack = stack
         self.drop_dm_percent = drop_dm_percent
+        self.delay = False
         self.stack_pool = []
 
-    def start(self):
+    def start(self, delay=False):
+        self.delay = delay
         self.thread.start()
 
     def run(self):
@@ -179,7 +215,11 @@ class TcpExchanger:
                 if not self.codes:
                     continue
                 if self.gen_errors and randint(0, 100) <= self.error_percent:
-                    message = 'error'
+                    if randint(0, 1):
+                        message = 'error'
+                    else:
+                        message = self.codes.popleft()
+                        message = "\n\r".join([message, message])
                 else:
                     message = self.codes.popleft()
                     if self.add_code_quality:
@@ -187,11 +227,6 @@ class TcpExchanger:
                             message += f'@{choice(BAD_CODES)}'
                         else:
                             message += f'@{choice(GOOD_CODES)}'
-                if (
-                    self.gen_duplicates and
-                    randint(0, 100) <= self.error_percent
-                ):
-                    message = "\n\r".join([message, message])
                 self.stack_pool.append(message)
                 if len(self.stack_pool) == self.stack:
                     message = "\n\r".join(self.stack_pool)
@@ -203,7 +238,10 @@ class TcpExchanger:
                     f"SENT: {message.strip()}"
                 )
                 
-                if self.drop_dm_percent and randint(0, 100) <= self.drop_dm_percent:
+                if (
+                    self.drop_dm_percent and randint(0, 100) <=
+                    self.drop_dm_percent
+                ):
                     logging.info(
                         f"[{len(self.codes)}]<{self.name}> "
                         f"DROPPED: {message.strip()}"
@@ -223,7 +261,9 @@ class TcpExchanger:
 
                 if self.transfer_buffer is not None:
                     if 'error' not in message:
-                        self.transfer_buffer[i].append(message[:-2] if self.add_code_quality else message)
+                        self.transfer_buffer[i].append(
+                            message[:-2] if self.add_code_quality else message
+                        )
                         i += 1
                         if i >= len(self.transfer_buffer):
                             i = 0
@@ -239,7 +279,9 @@ class SerialisationSetup:
                  bad_codes_percent: int = 0):
         self.agr_buffer = list()
         self.dm_list = deque([])
-        self.dm_printer = PrinterEmul('PRNSER', self.dm_list, printer_port)
+        self.dm_printer = PrinterEmul(
+            'PRNSER', self.dm_list, printer_port
+        )
         self.dm_camera = TcpExchanger(
             name="DMSER",
             timeout=read_interval,
@@ -269,15 +311,18 @@ class SerialisationFromFileSetup:
         self.agr_buffer = list()
         self.dm_list = deque([])
         if getattr(sys, 'frozen', False):
-            curPath = Path(sys.executable).parents[0]
+            cur_path = Path(sys.executable).parents[0]
         else:
-            curPath = Path(__file__).parents[0]
+            cur_path = Path(__file__).parents[0]
 
-        path_out = curPath / 'dm.csv'
+        path_out = cur_path / 'dm.csv'
         self.dm_file_path = path_out
-        self.dm_printer = FilePrinterEmul('PRNSER', self.dm_list, self.dm_file_path)
+        self.dm_printer = FilePrinterEmul(
+            'PRNSER', self.dm_list, self.dm_file_path
+        )
         self.dm_camera = TcpExchanger(
-            "DMSER", self.dm_list,
+            name="DMSER",
+            codes_to_send=self.dm_list,
             transfer_buffer=self.agr_buffer,
             timeout=read_interval,
             listen_port=camera_port,
@@ -296,14 +341,21 @@ class SerialisationFromFileSetup:
 
 
 class AggregationVerificationSetup:
-    def __init__(self, printer_port: int, camera_port: int, read_interval: float = 0.25):
+    def __init__(
+        self,
+        printer_port: int,
+        camera_port: int,
+        read_interval: float = 0.25
+    ):
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNAGR', self.dm_list, printer_port)
         self.dm_camera = TcpExchanger(
-            "VERIF", self.dm_list, can_stop=True,
+            name="VERIF",
+            codes_to_send=self.dm_list,
+            can_stop=True,
             listen_port=camera_port,
             timeout=read_interval,
-            gen_errors=False, gen_duplicates=False
+            gen_errors=False
         )
 
     def run(self):
@@ -338,16 +390,18 @@ class AggregationSetup:
         for camera, camera_obj in self.agr_cam_list.items():
             logging.info(f"Starting aggregation multicamera {camera} at "
                          f"port {camera_obj.port}...")
-            camera_obj.start()
+            camera_obj.start(delay=True)
 
 
 class PalletPrinter:
-    def __init__(self, port: int):
+    def __init__(self, port: int, name: str):
         self.data = deque([])
-        self.printer = PrinterEmul('PRNPAL', self.data, port)
+        self.printer = PrinterEmul(name, self.data, port)
+        self.name = name
 
     def run(self):
-        logging.info(f"Starting palette printer at port {self.printer.port}..")
+        logging.info(f"Starting {self.name} printer at port"
+                     f" {self.printer.port}..")
         self.printer.start()
 
 
@@ -356,7 +410,8 @@ class RefubrishingSetup:
         self.dm_file = dm_file
         self.dm_list = deque([])
         self.dm_camera = TcpExchanger(
-            "DMREF", self.dm_list,
+            name="DMREF",
+            codes_to_send=self.dm_list,
             listen_port=camera_port
         )
 
@@ -373,20 +428,20 @@ class RefubrishingSetup:
 
 def main_ser(args):
     agr_count = args.agr_count
-    gen_err = args.gen_err
+    gen_err = bool(args.gen_err)
     perc_err = args.perc_err
     dm_file = args.dm_file
     drop_dm = args.drop_dm
     read_interval = args.read_interval
-    add_code_quality = args.add_code_quality
+    add_code_quality = bool(args.add_code_quality)
     bad_code_quality_percent = args.bad_code_quality_percent
 
     if dm_file:
         sr = SerialisationFromFileSetup(
             23,
-            gen_err,
-            perc_err,
-            drop_dm,
+            gen_errors=gen_err,
+            error_percent=perc_err,
+            drop_dm_percent=drop_dm,
             read_interval=read_interval,
             add_code_quality=add_code_quality,
             bad_codes_percent=bad_code_quality_percent
@@ -399,25 +454,34 @@ def main_ser(args):
             drop_dm_percent=drop_dm,
             read_interval=read_interval,
             add_code_quality=add_code_quality,
-            bad_codes_percent=bad_code_quality_percent
+            bad_codes_percent=bad_code_quality_percent,
+
         )
-    agr_setup = AggregationSetup(27, sr.agr_buffer, agr_count, read_interval=read_interval)
-    agr_ver = AggregationVerificationSetup(9102, 32, read_interval=read_interval)
-    p = PalletPrinter(9103)
+    agr_setup = AggregationSetup(
+        27, sr.agr_buffer, agr_count, read_interval=read_interval
+    )
+    agr_ver = AggregationVerificationSetup(
+        9102, 32, read_interval=read_interval
+    )
+    p = PalletPrinter(9103, "LEVEL_1")
+    c = PalletPrinter(9104, "LEVEL_2")
+    g = PalletPrinter(9105, "LEVEL_3")
 
     sr.run()
     agr_setup.run()
     agr_ver.run()
     p.run()
+    c.run()
+    g.run()
 
 
-def main_refub(args):
+def main_refub(_):
     if getattr(sys, 'frozen', False):
-        curPath = Path(sys.executable).parents[0]
+        cur_path = Path(sys.executable).parents[0]
     else:
-        curPath = Path(__file__).parents[0]
+        cur_path = Path(__file__).parents[0]
 
-    path_out = curPath / 'dm.csv'
+    path_out = cur_path / 'dm.csv'
     if not path_out.exists():
         logging.error(f'{path_out} does not exist')
         return
@@ -448,7 +512,9 @@ if __name__ == '__main__':
     parser_s = subparsers.add_parser('s', help='Запуск в режиме сериализации')
     parser_s.add_argument(
         '-f', '--dm_file', choices=(0, 1), required=False, type=int,
-        default=0, help='Передавать марки из файла dm.csv. Используется для эмуляции линии без печати КМ.'
+        default=0,
+        help='Передавать марки из файла dm.csv. '
+             'Используется для эмуляции линии без печати КМ.'
     )
     parser_s.add_argument(
         '-a', '--agr_count', choices=range(1, 10), required=False, type=int,
@@ -468,14 +534,17 @@ if __name__ == '__main__':
     )
     parser_s.add_argument(
         '-r', '--read_interval', required=False, type=float,
-        default=0.15, help='Интервал передачи кодов маркировки (сек), например 0.15 = 150мс'
+        default=0.15,
+        help='Интервал передачи кодов маркировки (сек), например 0.15 = 150мс'
     )
     parser_s.add_argument(
-        '-q', '--add_code_quality', required=False, type=float,
-        default=0.15, help='Добавлять флаг качества кода в конец КМ: 0 - нет, 1 - да'
+        '-q', '--add_code_quality', choices=(0, 1), required=False, type=int,
+        default=0,
+        help='Добавлять флаг качества кода в конец КМ: 0 - нет, 1 - да'
     )
     parser_s.add_argument(
-        '-qe', '--bad_code_quality_percent', choices=range(1, 100), required=False, type=float,
+        '-qe', '--bad_code_quality_percent',
+        choices=range(1, 100), required=False, type=float,
         default=0.15, help='Процент кодов плохого качества (ниже B)'
     )
     parser_s.set_defaults(func=main_ser)
@@ -484,9 +553,9 @@ if __name__ == '__main__':
     parser_r = subparsers.add_parser('r', help='Запуск в режиме отбраковки')
     parser_r.set_defaults(func=main_refub)
 
-    args = parser.parse_args()
+    cmd_arguments = parser.parse_args()
     try:
-        args.func(args)
+        cmd_arguments.func(cmd_arguments)
     except AttributeError:
         parser.print_help()
         parser.exit()
