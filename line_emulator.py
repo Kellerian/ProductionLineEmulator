@@ -19,10 +19,7 @@ class CodeQuality(Enum):
     F = 'F'
 
 
-GOOD_CODES = (
-    CodeQuality.A.value,
-    CodeQuality.B.value
-)
+GOOD_CODES = (CodeQuality.A.value, CodeQuality.B.value)
 
 
 BAD_CODES = (
@@ -140,7 +137,7 @@ class PrinterEmul:
                                          f"PRINTED: {dm_extracted}")
                             self.dm_list.append(dm_extracted)
                             i += 1
-            sleep(0.01)
+            sleep(0.05)
 
 
 class FilePrinterEmul:
@@ -165,7 +162,7 @@ class TcpExchanger:
     def __init__(
         self, name: str,
         codes_to_send: deque,
-        transfer_buffer: list[deque] = None,
+        transfer_buffer: list[deque],
         listen_port: int = 23,
         timeout: float = 0.15,
         can_stop: bool = False,
@@ -259,7 +256,7 @@ class TcpExchanger:
                             )
                             self.connections.remove(client)
 
-                if self.transfer_buffer is not None:
+                if self.transfer_buffer:
                     if 'error' not in message:
                         self.transfer_buffer[i].append(
                             message[:-2] if self.add_code_quality else message
@@ -355,7 +352,8 @@ class AggregationVerificationSetup:
             can_stop=True,
             listen_port=camera_port,
             timeout=read_interval,
-            gen_errors=False
+            gen_errors=False,
+            transfer_buffer=[]
         )
 
     def run(self):
@@ -382,7 +380,8 @@ class AggregationSetup:
             cam_name = f"AGR_{i}"
             self.agr_cam_list[cam_name] = TcpExchanger(
                 name=cam_name, codes_to_send=self.agr_buffer[i],
-                listen_port=self.start_port + i, timeout=self.default_timeout
+                listen_port=self.start_port + i, timeout=self.default_timeout,
+                transfer_buffer=[]
             )
 
     def run(self):
@@ -412,7 +411,8 @@ class RefubrishingSetup:
         self.dm_camera = TcpExchanger(
             name="DMREF",
             codes_to_send=self.dm_list,
-            listen_port=camera_port
+            listen_port=camera_port,
+            transfer_buffer=[]
         )
 
     def load_dm_from_file(self):
@@ -457,22 +457,22 @@ def main_ser(args):
             bad_codes_percent=bad_code_quality_percent,
 
         )
-    agr_setup = AggregationSetup(
-        27, sr.agr_buffer, agr_count, read_interval=read_interval
-    )
-    agr_ver = AggregationVerificationSetup(
-        9102, 32, read_interval=read_interval
-    )
-    p = PalletPrinter(9103, "LEVEL_1")
-    c = PalletPrinter(9104, "LEVEL_2")
-    g = PalletPrinter(9105, "LEVEL_3")
-
     sr.run()
-    agr_setup.run()
-    agr_ver.run()
-    p.run()
-    c.run()
-    g.run()
+
+    if agr_count:
+        agr_setup = AggregationSetup(
+            27, sr.agr_buffer, agr_count, read_interval=read_interval
+        )
+        agr_setup.run()
+        agr_ver = AggregationVerificationSetup(
+            9102, 32, read_interval=read_interval
+        )
+        agr_ver.run()
+    else:
+        PalletPrinter(9102, "LEVEL_0").run()
+    PalletPrinter(9103, "LEVEL_1").run()
+    PalletPrinter(9104, "LEVEL_2").run()
+    PalletPrinter(9105, "LEVEL_3").run()
 
 
 def main_refub(_):
@@ -517,8 +517,8 @@ if __name__ == '__main__':
              'Используется для эмуляции линии без печати КМ.'
     )
     parser_s.add_argument(
-        '-a', '--agr_count', choices=range(1, 10), required=False, type=int,
-        default=3, help='Количество камер агрегации от 1 до 9'
+        '-a', '--agr_count', choices=range(0, 10), required=False, type=int,
+        default=3, help='Количество камер агрегации от 0 до 9'
     )
     parser_s.add_argument(
         '-g', '--gen_err', choices=(0, 1), required=False, type=int,
