@@ -10,6 +10,9 @@ from pathlib import Path
 import logging
 
 
+PAUSE = 0.001
+
+
 class CodeQuality(Enum):
     A = 'A'
     B = 'B'
@@ -61,6 +64,7 @@ class PrinterEmul:
         self.thread.start()
 
     def run(self):
+        print_buffers = {}
         connections = []
         i = 1
         while 1:
@@ -68,6 +72,7 @@ class PrinterEmul:
                 connected_client, address = self.server.accept()
                 connected_client.setblocking(True)
                 connections.append(connected_client)
+                print_buffers[connected_client] = deque([])
             except BlockingIOError:
                 pass
 
@@ -82,30 +87,30 @@ class PrinterEmul:
                     connections.remove(client)
                 if not msg_received:
                     continue
-                # logging.debug(f"DATA INPUT: {msg_received}")
                 if msg_received == f"{chr(27)}!?":
                     client.send('\x00'.encode())
+                    continue
                 elif msg_received == "~S,CHECK":
                     client.send('00'.encode())
+                    continue
                 elif msg_received == "OUT @LABEL":
-                    logging.debug(f"PRINTED: {i}")
                     client.send(f"{i}".encode())
+                    continue
                 elif msg_received == "~S,LABEL":
-                    logging.debug(f"FREE BUFFER: {1}")
-                    client.send(f"{1}".encode())
+                    client.send(f"{len(print_buffers[client])}".encode())
+                    continue
                 else:
                     msg_rows = msg_received.split("\n")
                     r = 0
+                    dm_extracted = ''
                     for row in msg_rows:
-                        dm_extracted = ''
                         if 'BARCODE=' in row:
                             row = row.replace('BARCODE=', '')
                             row = row.replace('~d034', '"')
                             dm_extracted = row.strip()
-                        elif 'DMATRIX' in row:
-                            row = row.replace(
-                                'DMATRIX 10,10,400,400,c126,', ''
-                            )
+                        elif 'DMATRIX' in row or "BARCODE " in row:
+                            params = row.split(",")
+                            row = params[-1]
                             row = row.replace('~d034', '"')
                             dm_extracted = row[1:-1].strip()
                         elif 'XRB0,0,' in row:
@@ -123,6 +128,7 @@ class PrinterEmul:
                             dm_extracted = dm_extracted[2:]
                         r += 1
                         if dm_extracted:
+                            i += 1
                             if '05060367340398' in dm_extracted:
                                 volume = randint(100, 1000)
                                 dm_extracted = (
@@ -135,9 +141,16 @@ class PrinterEmul:
                                 )
                             logging.info(f"[#{i}] <{self.name}> "
                                          f"PRINTED: {dm_extracted}")
-                            self.dm_list.append(dm_extracted)
-                            i += 1
-            sleep(0.05)
+                            print_buffers[client].append(dm_extracted)
+                            break
+                    else:
+                        if not dm_extracted:
+                            logging.debug(f"DATA INPUT: {msg_received}")
+                try:
+                    self.dm_list.append(print_buffers[client].popleft())
+                except IndexError:
+                    pass
+            sleep(PAUSE)
 
 
 class FilePrinterEmul:
@@ -164,7 +177,7 @@ class TcpExchanger:
         codes_to_send: deque,
         transfer_buffer: list[deque],
         listen_port: int = 23,
-        timeout: float = 0.15,
+        timeout: float = 0.05,
         can_stop: bool = False,
         gen_errors: bool = False,
         error_percent: int = 2,
@@ -207,18 +220,21 @@ class TcpExchanger:
                 self.connections.append(connected_client)
             except BlockingIOError:
                 pass
-            if len(self.connections):
+            if self.connections:
                 sleep(self.timeout)
                 if not self.codes:
                     continue
+                orig_code = None
                 if self.gen_errors and randint(0, 100) <= self.error_percent:
                     if randint(0, 1):
                         message = 'error'
                     else:
                         message = self.codes.popleft()
+                        orig_code = message
                         message = "\n\r".join([message, message])
                 else:
                     message = self.codes.popleft()
+                    orig_code = message
                     if self.add_code_quality:
                         if randint(0, 100) <= self.bad_codes_percent:
                             message += f'@{choice(BAD_CODES)}'
@@ -230,41 +246,40 @@ class TcpExchanger:
                     self.stack_pool.clear()
                 else:
                     continue
-                logging.info(
-                    f"[{len(self.codes)}]<{self.name}> "
-                    f"SENT: {message.strip()}"
-                )
-                
                 if (
                     self.drop_dm_percent and randint(0, 100) <=
                     self.drop_dm_percent
                 ):
                     logging.info(
-                        f"[{len(self.codes)}]<{self.name}> "
+                        f"[{self.name}]<{len(self.codes)}> "
                         f"DROPPED: {message.strip()}"
                     )
                 else:
                     for client in self.connections:
                         try:
                             client.send(bytes(message + "\n\r", 'utf-8'))
+                            logging.info(
+                                f"[{self.name}]<{len(self.codes)}> "
+                                f"SENT: {message.strip()}"
+                            )
                         except ConnectionAbortedError:
                             continue
                         except Exception as e:
                             logging.warning(
-                                f"[{len(self.codes)}]<{self.name}>"
+                                f"[{self.name}]<{len(self.codes)}>"
                                 f" ERROR: {client} {e}"
                             )
                             self.connections.remove(client)
 
                 if self.transfer_buffer:
-                    if 'error' not in message:
-                        self.transfer_buffer[i].append(
-                            message[:-2] if self.add_code_quality else message
-                        )
+                    if orig_code is not None:
+                        if self.add_code_quality:
+                            orig_code = orig_code[:-2]
+                        self.transfer_buffer[i].append(orig_code)
                         i += 1
                         if i >= len(self.transfer_buffer):
                             i = 0
-            sleep(0.01)
+            sleep(PAUSE)
 
 
 class SerialisationSetup:
@@ -296,7 +311,7 @@ class SerialisationSetup:
         logging.info(f"Started DM printer at port {self.dm_printer.port}...")
         self.dm_printer.start()
         logging.info(f"Started DM camera at port {self.dm_camera.port}...")
-        self.dm_camera.start()
+        self.dm_camera.start(delay=True)
 
 
 class SerialisationFromFileSetup:
@@ -342,7 +357,7 @@ class AggregationVerificationSetup:
         self,
         printer_port: int,
         camera_port: int,
-        read_interval: float = 0.25
+        read_interval: float = 0.05
     ):
         self.dm_list = deque([])
         self.dm_printer = PrinterEmul('PRNAGR', self.dm_list, printer_port)
@@ -367,7 +382,7 @@ class AggregationVerificationSetup:
 
 class AggregationSetup:
     def __init__(self, start_port: int, agr_buffer: list[deque],
-                 count: int = 1, read_interval: float = 0.25):
+                 count: int = 1, read_interval: float = 0.05):
         self.agr_cam_list = dict[str, TcpExchanger]()
         self.start_port = start_port
         self.agr_buffer = agr_buffer
