@@ -10,8 +10,7 @@ from pathlib import Path
 import logging
 
 
-PAUSE = 0.001
-
+PAUSE = 0.05
 
 class CodeQuality(Enum):
     A = 'A'
@@ -34,9 +33,7 @@ BAD_CODES = (
 
 
 class PrinterEmul:
-    def __init__(
-        self, name, dm_list: deque, port: int
-    ):
+    def __init__(self, name: str, dm_list: deque, port: int):
         self.SIZE = 4096
         self.name = name
         self.FORMAT = "utf-8"
@@ -47,8 +44,10 @@ class PrinterEmul:
         self.server.listen(5)
         self.dm_list = dm_list
         self.thread = Thread(target=self.run)
+        self._t_server = Thread(target=self.run_login)
+        self.connections: dict[socket.socket, deque[str] | None] = {}
 
-    def receive_all(self, s):
+    def receive_all(self, s: socket.socket):
         data_all = b''
         while True:
             data = s.recv(self.SIZE)
@@ -62,57 +61,72 @@ class PrinterEmul:
 
     def start(self):
         self.thread.start()
+        self._t_server.start()
 
-    def run(self):
-        print_buffers = {}
-        connections = []
-        i = 1
+    def run_login(self):
         while 1:
             try:
                 connected_client, address = self.server.accept()
                 connected_client.setblocking(True)
-                connections.append(connected_client)
-                print_buffers[connected_client] = deque([])
+                self.connections[connected_client] = deque([])
             except BlockingIOError:
-                pass
+                continue
 
-            for client in connections:
-                msg_received = ''
+    def run(self):
+        i = 1
+        while 1:
+            sleep(PAUSE)
+            for client, print_buffer in self.connections.copy().items():
                 try:
                     msg_received = self.receive_all(client).strip()
-                except ConnectionAbortedError:
+                except ConnectionAbortedError as e:
+                    logging.error(f"<{self.name}> ERROR: {client} {e}")
+                    del self.connections[client]
                     continue
                 except Exception as e:
-                    logging.error(f"[#{i}] <{self.name}> ERROR: {client} {e}")
-                    connections.remove(client)
+                    logging.error(f"<{self.name}> ERROR: {client} {e}")
+                    del self.connections[client]
+                    continue
+                if print_buffer:
+                    try:
+                        new_code = print_buffer.popleft()
+                        self.dm_list.append(new_code)
+                        logging.debug(
+                            f"[#{i}] <{self.name}> "
+                            f"BUFFER_SIZE: {len(print_buffer)} "
+                            f"SENT TO CAM: {new_code}"
+                        )
+                    except IndexError:
+                        pass
                 if not msg_received:
                     continue
+                logging.debug(f"[#{i}] <{self.name}> {msg_received}")
                 if msg_received == f"{chr(27)}!?":
+                    # logging.debug(f"<{self.name}> СТАТУС: Нормально")
                     client.send('\x00'.encode())
-                    continue
                 elif msg_received == "~S,CHECK":
                     client.send('00'.encode())
-                    continue
                 elif msg_received == "OUT @LABEL":
                     client.send(f"{i}".encode())
-                    continue
+                elif msg_received == "~HS":
+                    # logging.debug(f"<{self.name}> БУФФЕР: {len(print_buffer)}")
+                    client.send(f"0,0,0,0,{len(print_buffer)}".encode())
                 elif msg_received == "~S,LABEL":
-                    client.send(f"{len(print_buffers[client])}".encode())
-                    continue
+                    client.send(f"{len(print_buffer)}".encode())
                 else:
+                    # logging.debug(f"<{self.name}> MSG: {msg_received}")
                     msg_rows = msg_received.split("\n")
-                    r = 0
-                    dm_extracted = ''
-                    for row in msg_rows:
+                    for r, row in enumerate(msg_rows):
+                        dm_extracted = ''
                         if 'BARCODE=' in row:
                             row = row.replace('BARCODE=', '')
                             row = row.replace('~d034', '"')
                             dm_extracted = row.strip()
                         elif 'DMATRIX' in row or "BARCODE " in row:
-                            params = row.split(",")
-                            row = params[-1]
-                            row = row.replace('~d034', '"')
-                            dm_extracted = row[1:-1].strip()
+                            params = row.split(",", 5)
+                            splitted = params[-1]
+                            splitted = splitted.replace('~d034', '"')
+                            dm_extracted = splitted[1:-1].strip()
                         elif 'XRB0,0,' in row:
                             row = msg_rows[r + 1]
                             dm_extracted = row.strip()
@@ -124,11 +138,9 @@ class PrinterEmul:
                             row = row.replace('^FH^FD_7e', '')
                             row = row.replace('^FS', '')
                             dm_extracted = row.strip()
-                        if dm_extracted.startswith("~1"):
-                            dm_extracted = dm_extracted[2:]
-                        r += 1
                         if dm_extracted:
-                            i += 1
+                            if dm_extracted.startswith("~1"):
+                                dm_extracted = dm_extracted[2:]
                             if '05060367340398' in dm_extracted:
                                 volume = randint(100, 1000)
                                 dm_extracted = (
@@ -141,16 +153,8 @@ class PrinterEmul:
                                 )
                             logging.info(f"[#{i}] <{self.name}> "
                                          f"PRINTED: {dm_extracted}")
-                            print_buffers[client].append(dm_extracted)
-                            break
-                    else:
-                        if not dm_extracted:
-                            logging.debug(f"DATA INPUT: {msg_received}")
-                try:
-                    self.dm_list.append(print_buffers[client].popleft())
-                except IndexError:
-                    pass
-            sleep(PAUSE)
+                            print_buffer.append(dm_extracted)
+                            i += 1
 
 
 class FilePrinterEmul:
@@ -177,7 +181,7 @@ class TcpExchanger:
         codes_to_send: deque,
         transfer_buffer: list[deque],
         listen_port: int = 23,
-        timeout: float = 0.05,
+        timeout: float = 0.001,
         can_stop: bool = False,
         gen_errors: bool = False,
         error_percent: int = 2,
@@ -187,7 +191,6 @@ class TcpExchanger:
         bad_codes_percent: int = 0
     ):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setblocking(False)
         self.port = listen_port
         self.server.bind(("", listen_port))
         self.server.listen(5)
@@ -202,6 +205,7 @@ class TcpExchanger:
         self.bad_codes_percent = bad_codes_percent
         self.error_percent = error_percent
         self.thread = Thread(target=self.run)
+        self._t_server = Thread(target=self.run_login)
         self.stack = stack
         self.drop_dm_percent = drop_dm_percent
         self.delay = False
@@ -210,18 +214,22 @@ class TcpExchanger:
     def start(self, delay=False):
         self.delay = delay
         self.thread.start()
+        self._t_server.start()
+
+    def run_login(self):
+        while 1:
+            try:
+                connected_client, address = self.server.accept()
+                connected_client.setblocking(True)
+                self.connections.append(connected_client)
+            except BlockingIOError:
+                pass
 
     def run(self):
         i = 0
         while 1:
-            try:
-                connected_client, address = self.server.accept()
-                connected_client.setblocking(False)
-                self.connections.append(connected_client)
-            except BlockingIOError:
-                pass
+            sleep(PAUSE)
             if self.connections:
-                sleep(self.timeout)
                 if not self.codes:
                     continue
                 orig_code = None
@@ -255,9 +263,9 @@ class TcpExchanger:
                         f"DROPPED: {message.strip()}"
                     )
                 else:
-                    for client in self.connections:
+                    for client in self.connections.copy():
                         try:
-                            client.send(bytes(message + "\n\r", 'utf-8'))
+                            client.send(bytes(f"{message}\n\r", 'utf-8'))
                             logging.info(
                                 f"[{self.name}]<{len(self.codes)}> "
                                 f"SENT: {message.strip()}"
@@ -279,7 +287,6 @@ class TcpExchanger:
                         i += 1
                         if i >= len(self.transfer_buffer):
                             i = 0
-            sleep(PAUSE)
 
 
 class SerialisationSetup:
@@ -396,7 +403,7 @@ class AggregationSetup:
             self.agr_cam_list[cam_name] = TcpExchanger(
                 name=cam_name, codes_to_send=self.agr_buffer[i],
                 listen_port=self.start_port + i, timeout=self.default_timeout,
-                transfer_buffer=[]
+                transfer_buffer=[], stack=6
             )
 
     def run(self):
